@@ -45,6 +45,9 @@
   <a href="https://ko-fi.com/rootlesszen"><img src="https://img.shields.io/badge/Ko--fi-support-FF5E5B?style=flat-square&logo=kofi&logoColor=white&labelColor=16191C" alt="Support on Ko-fi"></a>
 </p>
 
+> [!NOTE]
+> **This is an unofficial fork by [Sqwer2017](https://github.com/Sqwer2017).** It adds a local-first profile and listening-insights layer, an optimized live background, and window/UI polish. Read **[FORK.md](FORK.md)** for the full overview, performance notes, status, and credits. The proposal is tracked in [Issue #236](https://github.com/rootscripts/riff/issues/236). This fork is not affiliated with the Riff team.
+
 > [!IMPORTANT]
 > **Contributions & Pull Requests Policy**  
 > This project is actively developed and maintained exclusively by its core team. **Public Pull Requests are disabled and will not be accepted.**

@@ -187,7 +187,8 @@ const EXCLUDED_PERSONAL_KEYS = new Set([
   'riff_my_wave_cache', 'riff_trending_cache', 'riff_wave_skips',
   'riff_failed_tracks', 'riff_mix_feedback', 'riff_pinned_tracks',
   'riff_sidebar_pinned_tracks', 'riff_pinned_playlists', 'riff_user_nickname',
-  'riff_user_avatar', 'riff_lastfm_sk', 'riff_lastfm_user',
+  'riff_user_avatar', 'riff_user_handle', 'riff_user_status', 'riff_user_bio',
+  'riff_user_banner', 'riff_profile_v1', 'riff_lastfm_sk', 'riff_lastfm_user',
   'riff_spotify_client_id', 'riff_owner_profile_backup'
 ]);
 
@@ -2033,6 +2034,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
                           navActiveIndicator: document.getElementById('nav-active-indicator'),
                           navDiscover: document.getElementById('nav-discover'),
+                          navProfile: document.getElementById('nav-profile'),
                           navFavorites: document.getElementById('nav-favorites'),
                           navAlbums: document.getElementById('nav-albums'),
                           navLocal: document.getElementById('nav-local'),
@@ -2070,6 +2072,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                           viewPlaylistDetail: document.getElementById('view-playlist-detail'),
                           viewAlbum: document.getElementById('view-album'),
                           viewArtist: document.getElementById('view-artist'),
+                          viewProfile: document.getElementById('view-profile'),
                           viewSettings: document.getElementById('view-settings'),
 
                           btnBackAlbum: document.getElementById('btn-back-album'),
@@ -2316,6 +2319,228 @@ document.addEventListener('DOMContentLoaded', async () => {
                           btnRefreshVibe: document.getElementById('btn-refresh-vibe')
   };
   if (el.nativeAudio) el.nativeAudio.preload = 'auto';
+
+  /*
+   * Мост для страницы профиля.
+   *
+   * profile.js живёт отдельным модулем и не имеет доступа к замыканию этого
+   * файла, поэтому наружу отдаётся только то, что действительно нужно:
+   * состояние плеера, управление, библиотека и пользовательские поля.
+   * Так основной 29k-строчный app.js остаётся почти нетронутым.
+   */
+  function riffProfileNormalizeTrack(track) {
+    if (!track || typeof track !== 'object') return null;
+
+    let duration = Number(track.duration);
+    if (!Number.isFinite(duration) && typeof track.duration === 'string') {
+      const parts = track.duration.split(':').map((part) => Number(part));
+      if (parts.length >= 2 && parts.every((part) => Number.isFinite(part))) {
+        duration = parts.length === 3
+          ? parts[0] * 3600 + parts[1] * 60 + parts[2]
+          : parts[0] * 60 + parts[1];
+      }
+    }
+
+    return {
+      id: String(track.id || track.videoId || `${track.artist || ''}::${track.title || ''}`),
+      title: String(track.title || 'Unknown track'),
+      artist: String(track.artist || track.channel || 'Unknown artist'),
+      album: String(track.album || ''),
+      cover: String(track.thumbnail || track.cover || track.coverUrl || track.image || track.artwork || ''),
+      source: String(track.platform || track.source || 'Riff'),
+      duration: Number.isFinite(duration) && duration > 0 ? duration : 0,
+      addedAt: Number(track.addedAt) || 0,
+      playedAt: Number(track.playedAt) || 0,
+    };
+  }
+
+  let riffProfileLevelsBuf = null;
+
+  window.RiffProfileBridge = {
+    isReady: () => Boolean(el && state),
+
+    getPlaybackSnapshot() {
+      const track = riffProfileNormalizeTrack(state.currentTrack);
+      const audio = el.nativeAudio;
+      const queue = Array.isArray(state.queue) ? state.queue : [];
+      const index = Number.isInteger(state.queueIndex) ? state.queueIndex : -1;
+      const upcoming = queue
+        .slice(Math.max(0, index + 1), Math.max(0, index + 4))
+        .map(riffProfileNormalizeTrack)
+        .filter(Boolean);
+
+      const audioDuration = audio && Number.isFinite(audio.duration) ? audio.duration : 0;
+      const isPlaying = audio && audio.getAttribute('src')
+        ? !audio.paused
+        : Boolean(state.isPlaying);
+
+      return {
+        track,
+        isPlaying,
+        currentTime: audio && Number.isFinite(audio.currentTime) ? audio.currentTime : 0,
+        duration: audioDuration > 0 ? audioDuration : (track ? track.duration : 0),
+        upcoming,
+        isShuffle: Boolean(state.isShuffle),
+        isRepeat: Boolean(state.isRepeat),
+      };
+    },
+
+    togglePlayback() {
+      togglePlayPause();
+    },
+
+    playNext() {
+      try { playNext(); } catch (_) {}
+    },
+
+    playPrev() {
+      try { playPrev(); } catch (_) {}
+    },
+
+    toggleShuffle() {
+      if (el.btnShuffle) el.btnShuffle.click();
+    },
+
+    toggleRepeat() {
+      if (el.btnRepeat) el.btnRepeat.click();
+    },
+
+    seek(seconds) {
+      const audio = el.nativeAudio;
+      if (!audio) return;
+      const limit = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : seconds;
+      try { audio.currentTime = Math.max(0, Math.min(seconds, limit)); } catch (_) {}
+    },
+
+    playQueueItem(index) {
+      const track = state.queue && state.queue[index];
+      if (track) playTrack(track, state.queue, index);
+    },
+
+    playUpcoming(offset) {
+      const base = Number.isInteger(state.queueIndex) ? state.queueIndex : -1;
+      const index = base + 1 + (Number(offset) || 0);
+      const track = state.queue && state.queue[index];
+      if (track) playTrack(track, state.queue, index);
+    },
+
+    getAudioLevels(bars) {
+      const engine = window.audioEngine;
+      const analyser = engine && engine.analyserNode;
+      if (!analyser || !analyser.frequencyBinCount) return null;
+
+      if (!riffProfileLevelsBuf || riffProfileLevelsBuf.length !== analyser.frequencyBinCount) {
+        riffProfileLevelsBuf = new Uint8Array(analyser.frequencyBinCount);
+      }
+
+      try {
+        analyser.getByteFrequencyData(riffProfileLevelsBuf);
+      } catch (_) {
+        return null;
+      }
+
+      const count = Math.max(1, Number(bars) || 48);
+      const step = Math.max(1, Math.floor(riffProfileLevelsBuf.length / count));
+      const levels = [];
+      let peak = 0;
+
+      for (let i = 0; i < count; i++) {
+        let sum = 0;
+        for (let j = 0; j < step; j++) sum += riffProfileLevelsBuf[i * step + j] || 0;
+        const value = Math.pow(sum / step / 255, 0.8);
+        peak = Math.max(peak, value);
+        levels.push(value);
+      }
+
+      return peak > 0.015 ? levels : null;
+    },
+
+    getLibrarySnapshot() {
+      const favorites = Array.isArray(state.favorites) ? state.favorites : [];
+      const playlists = Array.isArray(state.playlists) ? state.playlists : [];
+
+      /*
+       * Отдаём только идентификаторы, без полной нормализации треков.
+       * Страница профиля опрашивает библиотеку раз в две секунды; на большой
+       * фонотеке копировать все объекты каждый раз было бы дорого.
+       */
+      return {
+        favoriteIds: favorites
+          .map((track) => String((track && (track.id || track.videoId)) || ''))
+          .filter(Boolean),
+        playlists: playlists
+          .filter((playlist) => playlist && typeof playlist === 'object')
+          .map((playlist) => ({
+            id: String(playlist.id || ''),
+            name: String(playlist.name || 'Playlist'),
+            trackCount: Array.isArray(playlist.tracks) ? playlist.tracks.length : 0,
+            isPublic: Boolean(playlist.isPublic || playlist.public || playlist.privacy === 'Public'),
+          })),
+        counts: {
+          favorites: favorites.length,
+          playlists: playlists.length,
+        },
+      };
+    },
+
+    getUserProfile() {
+      return {
+        nick: localStorage.getItem('riff_user_nickname') || 'User',
+        avatar: localStorage.getItem('riff_user_avatar') || '',
+        handle: localStorage.getItem('riff_user_handle') || '',
+        status: localStorage.getItem('riff_user_status') || '',
+        bio: localStorage.getItem('riff_user_bio') || '',
+        banner: localStorage.getItem('riff_user_banner') || '',
+      };
+    },
+
+    saveUserProfile(patch) {
+      patch = patch && typeof patch === 'object' ? patch : {};
+      const keys = {
+        nick: 'riff_user_nickname',
+        avatar: 'riff_user_avatar',
+        handle: 'riff_user_handle',
+        status: 'riff_user_status',
+        bio: 'riff_user_bio',
+        banner: 'riff_user_banner',
+      };
+
+      Object.entries(keys).forEach(([field, key]) => {
+        if (!(field in patch)) return;
+        const value = patch[field];
+        if (value === null || value === undefined || value === '') {
+          localStorage.removeItem(key);
+        } else {
+          localStorage.setItem(key, String(value));
+        }
+      });
+
+      try { syncLocalAccountUI(); } catch (_) {}
+      try { window.RiffProfile?.refreshNavAvatar?.(); } catch (_) {}
+      return this.getUserProfile();
+    },
+
+    refreshAccountUI() {
+      try { syncLocalAccountUI(); } catch (_) {}
+      try { window.RiffProfile?.refreshNavAvatar?.(); } catch (_) {}
+    },
+
+    showToast(message, type) {
+      try { showToast(message, type || 'info'); } catch (_) {}
+    },
+
+    setView(view) {
+      switchView(view);
+    },
+
+    getView() {
+      return state.currentView;
+    },
+
+    getPreviousView() {
+      return state.previousView;
+    },
+  };
 
   if (el.viewSettings) {
     document.body.appendChild(el.viewSettings);
@@ -6583,6 +6808,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       'Date added (oldest)': 'Сначала старые',
       'Do you like these tracks?': 'Вам нравятся эти треки?',
       'Interface': 'Интерфейс',
+      'Live background': 'Живой фон',
       'Theme': 'Тема',
       'Banners': 'Баннеры',
       'Integrations': 'Интеграции',
@@ -10230,6 +10456,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     el.nativeAudio.addEventListener('ended', () => {
+      try { window.RiffProfile?.onTrackEnded?.(state.currentTrack); } catch (_) {}
       updatePlayPauseButton(false, false);
       if (state.sleepTimer && state.sleepTimer.mode === 'end') {
         state.sleepTimer = null;
@@ -16279,8 +16506,34 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
   window.openSettingsModal = openSettingsModal;
   window.closeSettingsModal = closeSettingsModal;
 
+  let profileRightPanelSaved = null;
+
+  function setRightPanelOpenState(open) {
+    state.isRightPanelOpen = Boolean(open);
+    if (el.rightPanel) el.rightPanel.classList.toggle('hidden', !open);
+    if (el.btnToggleLyricsPanel) el.btnToggleLyricsPanel.classList.toggle('active', open);
+    setTimeout(() => {
+      if (typeof resizeCanvases === 'function') resizeCanvases();
+    }, 150);
+  }
+
+  function enterProfileRightPanelMode() {
+    if (profileRightPanelSaved === null) {
+      profileRightPanelSaved = Boolean(state.isRightPanelOpen);
+    }
+    setRightPanelOpenState(false);
+  }
+
+  function leaveProfileRightPanelMode() {
+    if (profileRightPanelSaved === null) return;
+    const restore = profileRightPanelSaved;
+    profileRightPanelSaved = null;
+    setRightPanelOpenState(restore);
+  }
+
   function switchView(viewName) {
     if (typeof resetSettingsSearch === 'function') resetSettingsSearch();
+    const leavingProfile = state.currentView === 'profile' && viewName !== 'profile';
     const btnSbSettings = document.getElementById('btn-sb-settings');
     if (btnSbSettings) btnSbSettings.classList.toggle('active', viewName === 'settings');
     if (viewName === 'settings') {
@@ -16296,17 +16549,18 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
 
     requestAnimationFrame(() => {
       document.querySelectorAll('.no-enter-anim').forEach(c => c.classList.remove('no-enter-anim'));
-      [el.viewDiscover, el.viewFavorites, el.viewAlbums, el.viewLocal, el.viewHistory, el.viewQueue, el.viewPlaylistDetail, el.viewAlbum, el.viewArtist].forEach(v => {
+      [el.viewDiscover, el.viewFavorites, el.viewAlbums, el.viewLocal, el.viewHistory, el.viewQueue, el.viewProfile, el.viewPlaylistDetail, el.viewAlbum, el.viewArtist].forEach(v => {
         if (v) v.classList.remove('active');
       });
 
         const nestedView = viewName === 'playlist-detail' || viewName === 'album' || viewName === 'artist';
         if (!nestedView) {
-          [el.navDiscover, el.navFavorites, el.navAlbums, el.navLocal, el.navHistory, el.navQueue, el.navSettings].forEach(n => {
+          [el.navDiscover, el.navProfile, el.navFavorites, el.navAlbums, el.navLocal, el.navHistory, el.navQueue, el.navSettings].forEach(n => {
             if (n) n.classList.remove('active');
           });
           const navMap = {
             discover: el.navDiscover,
+            profile: el.navProfile,
             favorites: el.navFavorites,
             albums: el.navAlbums,
             local: el.navLocal,
@@ -16344,6 +16598,11 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
             if (el.viewQueue) el.viewQueue.classList.add('active');
             if (el.navQueue) el.navQueue.classList.add('active');
             renderQueueView();
+          } else if (viewName === 'profile') {
+            if (el.viewProfile) el.viewProfile.classList.add('active');
+            if (el.navProfile) el.navProfile.classList.add('active');
+            enterProfileRightPanelMode();
+            try { window.RiffProfile?.onShow?.(); } catch (_) {}
           } else if (viewName === 'playlist-detail') {
             if (el.viewPlaylistDetail) el.viewPlaylistDetail.classList.add('active');
           } else if (viewName === 'album') {
@@ -16355,6 +16614,7 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
           }
 
           refreshNavBadges();
+          if (leavingProfile) leaveProfileRightPanelMode();
 
           highlightPlayingRow();
           if (typeof syncHomeAmbientVisibility === 'function') syncHomeAmbientVisibility();
@@ -16362,6 +16622,7 @@ function renderClickableArtists(container, rawArtist, hintTrack = null) {
           if (typeof renderSidebarLibraryFeed === 'function') renderSidebarLibraryFeed();
     });
   }
+  window.switchView = switchView;
 
   function applyStackedRadius(container, itemSelector, horizontal) {
     if (!container) return;
@@ -16642,6 +16903,21 @@ function updateNavIndicator(animate) {
     if (el.btnMinimize) el.btnMinimize.addEventListener('click', () => window.electronAPI.minimizeWindow());
     if (el.btnMaximize) el.btnMaximize.addEventListener('click', () => window.electronAPI.maximizeWindow());
     if (el.btnClose) el.btnClose.addEventListener('click', () => window.electronAPI.closeWindow());
+    const btnTopWindowMinimize = document.getElementById('btn-top-window-minimize');
+    const btnTopWindowMaximize = document.getElementById('btn-top-window-maximize');
+    const btnTopWindowClose = document.getElementById('btn-top-window-close');
+    if (btnTopWindowMinimize) btnTopWindowMinimize.addEventListener('click', () => window.electronAPI.minimizeWindow());
+    if (btnTopWindowMaximize) btnTopWindowMaximize.addEventListener('click', () => window.electronAPI.maximizeWindow());
+    if (btnTopWindowClose) btnTopWindowClose.addEventListener('click', () => window.electronAPI.closeWindow());
+  }
+
+  const topNav = document.querySelector('.top-nav');
+  if (topNav) {
+    topNav.addEventListener('dblclick', (event) => {
+      if (!document.body.classList.contains('hide-titlebar')) return;
+      if (event.target.closest('button, input, textarea, select, a, .search-box, .platform-switch-container, .offline-top-banner')) return;
+      if (window.electronAPI && window.electronAPI.minimizeWindow) window.electronAPI.minimizeWindow();
+    });
   }
 
   function goHome() {
@@ -16681,6 +16957,7 @@ function updateNavIndicator(animate) {
     }
   });
 
+  if (el.navProfile) el.navProfile.addEventListener('click', () => switchView('profile'));
   if (el.navFavorites) el.navFavorites.addEventListener('click', () => switchView('favorites'));
   if (el.navAlbums) el.navAlbums.addEventListener('click', () => switchView('albums'));
   if (el.navLocal) el.navLocal.addEventListener('click', () => switchView('local'));
@@ -19757,7 +20034,7 @@ function bindCoverHoldZoom(wrapEl) {
         const max = input.max === '' ? 100 : parseFloat(input.max);
         const rawRatio = max > min ? (parseFloat(input.value) - min) / (max - min) : 0;
         if (input.id === 'volume-slider') {
-          const v = (!state.isMuted && rawRatio > 0) ? (0.06 + rawRatio * 0.94) : 0;
+          const v = (!state.isMuted && rawRatio > 0) ? rawRatio : 0;
           wrap.style.setProperty('--v', v);
         } else {
           wrap.style.setProperty('--v', rawRatio);
@@ -25655,6 +25932,7 @@ function bindCoverHoldZoom(wrapEl) {
     });
 
     updateAccountHeroColors(avatar);
+    try { window.RiffProfile?.refreshNavAvatar?.(); } catch (_) {}
     loadEasterMemes();
   }
   window.syncLocalAccountUI = syncLocalAccountUI;
@@ -30682,6 +30960,11 @@ function bindCoverHoldZoom(wrapEl) {
         divider.parentNode.insertBefore(btn, divider);
       }
     });
+    const playlistsBtn = nav.querySelector('#btn-toggle-playlists-drawer');
+    const localBtn = nav.querySelector('.nav-item[data-view="local"]');
+    if (playlistsBtn && localBtn && playlistsBtn.parentNode === nav && localBtn.parentNode === nav) {
+      nav.insertBefore(playlistsBtn, localBtn);
+    }
     if (typeof updateNavIndicator === 'function') {
       requestAnimationFrame(() => updateNavIndicator(false));
     }
@@ -31333,6 +31616,22 @@ function bindCoverHoldZoom(wrapEl) {
       const nextState = !btn.classList.contains('active');
       btn.classList.toggle('active', nextState);
       localStorage.setItem('riff_like_album_tracks', nextState ? '1' : '0');
+    });
+  }
+
+  function initProfileBackgroundSetting() {
+    const btn = document.getElementById('btn-profile-bg-effects');
+    if (!btn) return;
+
+    const isEnabled = () => localStorage.getItem('riff_profile_bg_effects') !== '0';
+    const sync = () => btn.classList.toggle('active', isEnabled());
+    sync();
+
+    btn.addEventListener('click', () => {
+      const nextState = !btn.classList.contains('active');
+      btn.classList.toggle('active', nextState);
+      localStorage.setItem('riff_profile_bg_effects', nextState ? '1' : '0');
+      window.dispatchEvent(new CustomEvent('riff:profile-bg-changed'));
     });
   }
 
@@ -32313,6 +32612,7 @@ function bindCoverHoldZoom(wrapEl) {
   initDesktopShortcutSetting();
   initDefaultSettingsStudio();
   initLikeAlbumTracksSetting();
+  initProfileBackgroundSetting();
   resizeCanvases();
   updateOfflineStorageUI();
   updateMusicFolderUI();
